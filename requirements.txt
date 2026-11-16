@@ -1,0 +1,12 @@
+cloakbrowser
+pandas
+pydantic
+requests
+numpy
+openai
+python-dotenv
+openpyxl
+xlrd
+beautifulsoup4
+lxml
+Pillow

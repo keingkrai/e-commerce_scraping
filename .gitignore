@@ -1,0 +1,26 @@
+# ── Secrets ───────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Runtime data (never commit) ───────────────────────────
+# Browser profiles hold cookies / saved logins; collected_data and log
+# hold scraped output, HTML snapshots and screenshots.
+data/
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ── Office / OS / editor ──────────────────────────────────
+~$*
+.~lock.*
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

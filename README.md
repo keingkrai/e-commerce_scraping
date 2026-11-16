@@ -1,0 +1,80 @@
+# Web Scraping — E-Commerce Scrapers
+
+ชุด scraper สำหรับเก็บข้อมูลสินค้า / รายละเอียด / รีวิว จากแพลตฟอร์ม e-commerce
+ไทย จีน และ UK โดยใช้ [CloakBrowser](https://pypi.org/project/cloakbrowser/)
+มี `scrap_agent.py` เป็นตัวควบคุมหลัก (เมนูแบบ interactive)
+
+| ภูมิภาค | แพลตฟอร์ม | โมดูล |
+|---|---|---|
+| ไทย | Shopee | `scrapers/cloak_shopee_AI_bot.py` |
+| ไทย | Lazada | `scrapers/cloak_lazada.py` |
+| ไทย | Watsons | `scrapers/cloak_watsons.py` |
+| ไทย | Konvy | `scrapers/cloak_konvy.py` |
+| จีน | Pinduoduo | `scrapers/cloak_pinduoduo.py` |
+| จีน | Taobao | `scrapers/cloak_taobao.py` |
+| UK | Superdrug | `scrapers/cloak_superdrug.py` |
+| UK | Tesco | `scrapers/cloak_tesco.py` |
+| UK | Amazon UK | `scrapers/cloak_amazon_uk.py` |
+
+## โครงสร้างโปรเจกต์
+
+```
+Web_Scraping/
+├── scrap_agent.py          # ตัวควบคุมหลัก — เลือกแพลตฟอร์ม + action จากเมนู
+├── scrapers/               # scraper แยกตามแพลตฟอร์ม (cloak_<site>.py)
+├── scripts/                # สคริปต์ batch สำหรับงานเฉพาะ
+│   ├── scrape_brand_search.py     # ค้นหาตามรายชื่อแบรนด์ (Shopee/Lazada/Konvy)
+│   ├── scrape_category_search.py  # ค้นหาตามหมวดสินค้า (Shopee/Lazada/Konvy)
+│   ├── scrape_target_skus.py      # ดึง detail + รีวิวจากไฟล์ target SKUs
+│   ├── scrape_lemon8_search.py    # ดึงโพสต์ Lemon8 + คอมเมนต์ตาม keyword
+│   └── lemon8_scraper.py          # parser โพสต์ Lemon8 (ใช้เดี่ยว ๆ ได้)
+├── notebooks/              # Jupyter notebook (Konvy)
+├── data/                   # ข้อมูลตอนรัน — ไม่ขึ้น git (ดู .gitignore)
+│   ├── <site>/browser_session | my_session   # โปรไฟล์เบราว์เซอร์ (cookies/login)
+│   ├── <site>/collected_data/                # ผลลัพธ์ .xlsx (+ temp/ checkpoint)
+│   ├── <site>/log/                           # log, HTML/screenshot ตอนเจอ captcha
+│   └── combined_output/                      # ไฟล์รวมจาก scrap_agent.py
+├── requirements.txt
+└── .env.example
+```
+
+โฟลเดอร์ใน `data/` สร้างให้อัตโนมัติตอนรันครั้งแรก
+
+## ติดตั้ง
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+copy .env.example .env      # แล้วใส่ OPEN_ROUTER_API
+```
+
+## วิธีใช้
+
+**ต้องรันจากโฟลเดอร์ root ของโปรเจกต์เสมอ** (path ทั้งหมดอ้างอิงจาก
+current directory เช่น `./data/shopee/...`)
+
+```bash
+python scrap_agent.py
+```
+
+เลือก Auto (A) เพื่ออ่าน URL จากไฟล์ memory JSON หรือ Manual (M) เพื่อพิมพ์ URL
+เอง — รายละเอียด action ของแต่ละแพลตฟอร์มอยู่ใน docstring ด้านบนของ
+`scrap_agent.py`
+
+สคริปต์ batch:
+
+```bash
+python scripts/scrape_brand_search.py --platforms shopee,lazada
+python scripts/scrape_category_search.py --categories shampoo,conditioner
+python scripts/scrape_target_skus.py "path\to\dd_target_skus_REVISED.xlsx"
+python scripts/scrape_lemon8_search.py --keyword "..." --urls-file urls.txt
+```
+
+### หมายเหตุ
+
+- Pinduoduo / Taobao ต้อง login ก่อน (action 0) — session จะเก็บไว้ใน
+  `data/<site>/my_session`
+- Amazon UK ต้องรัน action 0 หนึ่งครั้งเพื่อตั้ง postcode UK
+- `scrap_agent.py` ใช้ไฟล์ memory JSON ที่ `MEMORY_FILE` (แก้ path ได้ในไฟล์
+  หรือพิมพ์ path ใหม่ตอนรัน)
