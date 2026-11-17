@@ -10,7 +10,11 @@ Supported platforms  (from the JSON memory file):
   • Shopee   → SHOPEE_LINK   : list of shop URLs      → action 2 (+3)
   • Lazada   → LAZADA_LINK   : list of shop URLs      → action 2 (+3)
   • Watsons  → WATSONS_LINK  : list of brand URLs     → action 2 (+3)
+                                  (put "ALL" in the list = every brand on Watsons'
+                                  brand list; in manual action 2 pick option 2)
   • Konvy    → KONVY_LINK    : list of brand/keywords → action 1 (full detail in one pass)
+                                  (put "ALL" in the list = every brand on Konvy's brand
+                                  index; in manual action 1 pick option 2)
   • Pinduoduo → PINDUODUO_LINK : list of keywords     → action 1 (listing only;
                                   needs a logged-in session — run action 0 first;
                                   whole categories via action 6 and whole shops
@@ -26,7 +30,8 @@ Supported platforms  (from the JSON memory file):
                                   (UK; Akamai-protected — paced slowly, stops if blocked)
   • Amazon UK → AMAZON_UK_LINK : keywords or search URLs → action 1 (+3)
                                   (run action 0 once first to set a UK delivery postcode;
-                                  reviews = only those shown on the product page)
+                                  reviews = only those shown on the product page;
+                                  a whole category's top products via action 6)
 
 STEPS IN THE PIPELINE
 ──────────────────────
@@ -117,7 +122,8 @@ STEPS = {
         "desc": (
             "Scrape product listings from search results\n"
             "      Konvy: keyword = brand/title text; full detail\n"
-            "             (brand/price/product_id) included in one pass\n"
+            "             (brand/price/product_id) included in one pass;\n"
+            "             option 2 = EVERY brand on the brand index (resumable)\n"
             "      Taobao: search results incl. sales (X人付款) — details via action 3\n"
             "      Tesco: keywords, or pasted search / category (/browse/…) URLs —\n"
             "             price, Clubcard price, GTIN, rating, aisle (48 per page)\n"
@@ -131,7 +137,8 @@ STEPS = {
         "name": "Collect Shop / Brand Products",
         "desc": (
             "Shopee/Lazada: scrape all products from a shop URL\n"
-            "      Watsons: scrape all products from brand URL(s)\n"
+            "      Watsons: scrape all products from brand URL(s), or option 2 = EVERY\n"
+            "               brand on the brand list (~755; resumable, details optional)\n"
             "               (includes details + description in one pass)\n"
             "      Pinduoduo: products from mall_id(s) or shop link(s); uses the saved\n"
             "                 session (run action 0 first if it has expired)\n"
@@ -181,11 +188,13 @@ STEPS = {
     6: {
         "name": "Collect Category Products",
         "desc": (
-            "Scrape listings from the site's own category pages [Pinduoduo only]\n"
-            "      e.g. 美妆 = every sub-category, 美妆/面膜 = one sub-category"
+            "Scrape listings from the site's own category pages [Pinduoduo / Amazon UK]\n"
+            "      Pinduoduo: 美妆 = every sub-category, 美妆/面膜 = one sub-category\n"
+            "      Amazon UK: paste a category URL — top products of it and every\n"
+            "                 sub-category (Best Sellers top 100 + search pages)"
         ),
         "emoji": "📂",
-        "platforms": ["pinduoduo"],
+        "platforms": ["pinduoduo", "amazon_uk"],
     },
 }
 
@@ -343,6 +352,86 @@ def get_brand_map_input() -> dict:
         if name and url:
             brand_map[name] = url
     return brand_map
+
+
+def _ask_int(prompt: str, default: int, lo: int, hi: int) -> int:
+    """Whole number between lo and hi; Enter or anything else keeps the default."""
+    raw = safe_input(f"{prompt} [default: {default}]: ").strip()
+    if raw.isdigit() and lo <= int(raw) <= hi:
+        return int(raw)
+    if raw:
+        print(f"   ↳ not a number from {lo} to {hi} — using {default}")
+    return default
+
+
+def _is_all_brands_request(urls: List[str]) -> bool:
+    """WATSONS_LINK / KONVY_LINK containing ALL (or *) means: every brand on that site's brand list."""
+    return any(u.strip().upper() in ("ALL", "*") for u in urls)
+
+
+async def _run_konvy_all_brands() -> Optional[pd.DataFrame]:
+    """Ask the all-brands options, then run konvy.run_all_brands()."""
+    print("\nKonvy ALL-brands mode: reads Konvy's brand list (brand.php, ~1,200 brands), then pages through")
+    print("each brand's own page (konvy.com/brand/<name>/, 40 products a page) and checks the count against")
+    print("the number Konvy prints there. Progress is saved after every brand, so it can be stopped and")
+    print("continued. Listing only is quick; with full details it is one page load per product (days).")
+
+    detail = safe_input(
+        "\nCollect full product details too? (y/n) [default: y]\n"
+        "  n = brand + product name + URL only (much faster; details later via action 3): ",
+        default="y",
+    ).strip().lower() not in ("n", "no")
+
+    only = get_list_input("Only these brand names (Enter = every brand):")
+    max_brands = _ask_int("Brands to scrape in this run (0 = all remaining)", 0, 0, 5000) or None
+
+    brands_file = safe_input(
+        "\nBrand list file (.csv/.xlsx with a 'name' column, optional 'slug') — Enter = read Konvy's brand index: "
+    ).strip().strip('"') or None
+
+    resume = False
+    saved = konvy.all_brands_checkpoint_summary(detail)
+    if saved:
+        print(f"\n💾 Earlier run from {saved['last_collected']}: {saved['brands_done']:,} brand(s) done, "
+              f"{saved['products']:,} product(s)")
+        resume = safe_input(
+            "Continue from it and skip those brands? (y/n) [default: y]: ", default="y"
+        ).strip().lower() in ("", "y", "yes")
+
+    return await konvy.run_all_brands(
+        detail=detail, only=only or None, max_brands=max_brands, resume=resume,
+        brands_file=brands_file,
+    )
+
+
+async def _run_watsons_all_brands() -> Optional[pd.DataFrame]:
+    """Ask the all-brands options, then run watsons.run_all_brands()."""
+    print("\nWatsons ALL-brands mode: walks Watsons' whole brand list (~755 brands), one brand page")
+    print("after another, ~10-15 s apart (robots.txt Crawl-delay 10). Progress is saved after every")
+    print("brand, so it can be stopped and continued — a full run with details spans several days.")
+    print("robots.txt also asks for visits 04:00–08:45 UTC (11:00–15:45 Thai time).")
+
+    detail = safe_input(
+        "\nCollect full product details too? (y/n) [default: y]\n"
+        "  n = brand + product name + URL only (much faster; details later via action 3): ",
+        default="y",
+    ).strip().lower() not in ("n", "no")
+
+    only = get_list_input("Only these brand names (Enter = every brand):")
+    max_brands = _ask_int("Brands to scrape in this run (0 = all remaining)", 0, 0, 5000) or None
+
+    resume = False
+    saved = watsons.all_brands_checkpoint_summary(detail)
+    if saved:
+        print(f"\n💾 Earlier run from {saved['last_collected']}: {saved['brands_done']:,} brand(s) done, "
+              f"{saved['products']:,} product(s)")
+        resume = safe_input(
+            "Continue from it and skip those brands? (y/n) [default: y]: ", default="y"
+        ).strip().lower() in ("", "y", "yes")
+
+    return await watsons.run_all_brands(
+        detail=detail, only=only or None, max_brands=max_brands, resume=resume,
+    )
 
 
 def _ask_resume(scraper, site: str, kind: str) -> bool:
@@ -596,31 +685,40 @@ async def run_auto_pipeline(memory_path: Path = MEMORY_FILE) -> None:
 
     # ── Watsons ───────────────────────────────────────────────────────────────
     if "watsons" in active:
-        print_header("🟩 Watsons — Action 2: Brand Products + Details")
-        brand_map = _build_watsons_brand_map(platform_urls["watsons"])
-
-        print("\n  Brand map inferred from URLs:")
-        for name, url in brand_map.items():
-            print(f"    • {name:<30} {url}")
-
-        # Allow the user to rename brands before scraping
-        edit = safe_input("\n  Edit brand names? (y/n) [default: n]: ", default="n").strip().lower()
-        if edit in ("y", "yes"):
-            new_map: Dict[str, str] = {}
-            for name, url in brand_map.items():
-                new_name = safe_input(f"    Rename '{name}' (leave blank to keep): ").strip()
-                new_map[new_name if new_name else name] = url
-            brand_map = new_map
-
-        context_label = _label_from_brand_map(brand_map)
         df_watsons: Optional[pd.DataFrame] = None
 
-        try:
-            # Watsons action 2 (run_brand_url) already collects full product
-            # details + description in a single pass — no separate action 3 needed.
-            df_watsons = await watsons.run_brand_url(brand_map)
-        except Exception as exc:
-            print(f"❌ Watsons action 2 error: {exc}")
+        if _is_all_brands_request(platform_urls["watsons"]):
+            # WATSONS_LINK = ["ALL"] → every brand on Watsons' brand list
+            print_header("🟩 Watsons — ALL brands")
+            try:
+                df_watsons = await _run_watsons_all_brands()
+            except Exception as exc:
+                print(f"❌ Watsons all-brands error: {exc}")
+        else:
+            print_header("🟩 Watsons — Action 2: Brand Products + Details")
+            brand_map = _build_watsons_brand_map(platform_urls["watsons"])
+
+            print("\n  Brand map inferred from URLs:")
+            for name, url in brand_map.items():
+                print(f"    • {name:<30} {url}")
+
+            # Allow the user to rename brands before scraping
+            edit = safe_input("\n  Edit brand names? (y/n) [default: n]: ", default="n").strip().lower()
+            if edit in ("y", "yes"):
+                new_map: Dict[str, str] = {}
+                for name, url in brand_map.items():
+                    new_name = safe_input(f"    Rename '{name}' (leave blank to keep): ").strip()
+                    new_map[new_name if new_name else name] = url
+                brand_map = new_map
+
+            context_label = _label_from_brand_map(brand_map)
+
+            try:
+                # Watsons action 2 (run_brand_url) already collects full product
+                # details + description in a single pass — no separate action 3 needed.
+                df_watsons = await watsons.run_brand_url(brand_map)
+            except Exception as exc:
+                print(f"❌ Watsons action 2 error: {exc}")
 
         if df_watsons is not None and not df_watsons.empty:
             print(f"\n✅ {len(df_watsons):,} product(s) collected from Watsons.")
@@ -634,11 +732,15 @@ async def run_auto_pipeline(memory_path: Path = MEMORY_FILE) -> None:
         df_konvy: Optional[pd.DataFrame] = None
 
         try:
-            # Konvy's search already scrapes full product detail (brand,
-            # price, product_id, …) in a single pass — no separate action
-            # needed here. Reviews (action 4) need product_id and are only
-            # available via the manual pipeline for now.
-            df_konvy = await konvy.run_search_keyword(keywords)
+            if _is_all_brands_request(keywords):
+                # KONVY_LINK = ["ALL"] → every brand on Konvy's brand index
+                df_konvy = await _run_konvy_all_brands()
+            else:
+                # Konvy's search already scrapes full product detail (brand,
+                # price, product_id, …) in a single pass — no separate action
+                # needed here. Reviews (action 4) need product_id and are only
+                # available via the manual pipeline for now.
+                df_konvy = await konvy.run_search_keyword(keywords)
         except Exception as exc:
             print(f"❌ Konvy error: {exc}")
 
@@ -878,9 +980,18 @@ async def run_manual_pipeline() -> None:
                 print("  cerave , https://www.tesco.com/shop/en-GB/browse/health-and-beauty/face-skincare/all")
             elif platform == "amazon_uk":
                 print("\nAmazon UK: type keywords, or paste amazon.co.uk search URLs (filters are kept).")
-            keywords = [k.strip() for k in safe_input("Enter keywords (comma separated): ").split(",") if k.strip()]
+            konvy_all_brands = False
+            if platform == "konvy":
+                print("\nKonvy:  [1] specific brands / keywords")
+                print("        [2] ALL brands on Konvy's brand index (resumable)")
+                konvy_all_brands = safe_input("Choose (1/2) [default: 1]: ", default="1").strip() == "2"
+
+            keywords = (
+                [] if konvy_all_brands
+                else [k.strip() for k in safe_input("Enter keywords (comma separated): ").split(",") if k.strip()]
+            )
             if not context_label:
-                context_label = _label_from_keywords(keywords)
+                context_label = "all_brands" if konvy_all_brands else _label_from_keywords(keywords)
 
             df_search: Optional[pd.DataFrame] = None
             if platform == "shopee":
@@ -896,7 +1007,10 @@ async def run_manual_pipeline() -> None:
             elif platform == "konvy":
                 # Konvy's search (keyword = brand/title text) also scrapes
                 # full detail per listing in one pass — same reasoning as Watsons.
-                df_search = await konvy.run_search_keyword(keywords)
+                df_search = (
+                    await _run_konvy_all_brands() if konvy_all_brands
+                    else await konvy.run_search_keyword(keywords)
+                )
                 collected_df = df_search
             elif platform == "pinduoduo":
                 # Kept so a later action 3/4 inherits the listing's price and
@@ -962,7 +1076,10 @@ async def run_manual_pipeline() -> None:
                 else []
             )
 
-            if product_urls and platform in ("watsons", "konvy"):
+            if product_urls and platform == "konvy" and "sale_price" not in df_search.columns:
+                print(f"\n✅ {len(product_urls)} product(s) found — listing only (no price/product_id yet); "
+                      "run action 3 with this file for details.")
+            elif product_urls and platform in ("watsons", "konvy"):
                 print(f"\n✅ {len(product_urls)} product(s) found — full detail already included (brand/price/…).")
             elif product_urls and platform == "taobao":
                 print(f"\n✅ {len(product_urls)} product(s) found — "
@@ -988,14 +1105,26 @@ async def run_manual_pipeline() -> None:
         # ── Action 2 : Shop / Brand Products ──────────────────────────────────
         elif action == 2:
             if platform == "watsons":
-                brand_map = get_brand_map_input()
-                if not brand_map:
-                    print("❌ No brand entries provided. Skipping.")
-                    continue
-                if not context_label:
-                    context_label = _label_from_brand_map(brand_map)
-                collected_df = await watsons.run_brand_url(brand_map)
-                df_shop = collected_df
+                print("\nWatsons:  [1] specific brands (name | URL)")
+                print("          [2] ALL brands on Watsons' brand list (~755, resumable)")
+                scope = safe_input("Choose (1/2) [default: 1]: ", default="1").strip()
+                if scope == "2":
+                    collected_df = await _run_watsons_all_brands()
+                    if collected_df is None or collected_df.empty:
+                        print("❌ No Watsons products collected. Skipping.")
+                        continue
+                    if not context_label:
+                        context_label = "all_brands"
+                    df_shop = collected_df
+                else:
+                    brand_map = get_brand_map_input()
+                    if not brand_map:
+                        print("❌ No brand entries provided. Skipping.")
+                        continue
+                    if not context_label:
+                        context_label = _label_from_brand_map(brand_map)
+                    collected_df = await watsons.run_brand_url(brand_map)
+                    df_shop = collected_df
             elif platform == "pinduoduo":
                 shops = get_list_input("Enter mall_id(s) or full shop link(s), copied whole from the address bar:")
                 if not shops:
@@ -1052,6 +1181,47 @@ async def run_manual_pipeline() -> None:
                 else:
                     collected_df = await lazada.run_product_by_shop(shop_urls)
                 df_shop = collected_df
+
+        # ── Action 6 : Category Products (Amazon UK) ──────────────────────────
+        elif action == 6 and platform == "amazon_uk":
+            print("\nAmazon UK: paste a category URL from amazon.co.uk — a /b?node=… page, a search URL")
+            print("with rh=n:…, or a Best Sellers page — or just the node number.")
+            print("This collects the TOP of the category and each sub-category, not every product.")
+            start = safe_input("Category URL / node: ").strip().strip('"')
+            if not start:
+                print("❌ No category given. Skipping.")
+                continue
+            depth = _ask_int("Sub-category levels to follow", amazon_uk.CATEGORY_MAX_DEPTH, 0, 6)
+            print("\nEvery-product mode pages through each lowest sub-category to the end and splits big")
+            print("ones by price (£0–3, £3–5, …) so Amazon's ~7-page limit doesn't cut them off.")
+            print("Far more pages: plan on many runs. Items with no price (unavailable) are still missed.")
+            every = safe_input("Collect EVERY product? (y/n) [default: n]: ", default="n").strip().lower() in ("y", "yes")
+            pages = amazon_uk.CATEGORY_PAGES_PER_NODE
+            if not every:
+                pages = _ask_int("Search pages per lowest sub-category (~48 items each)",
+                                 amazon_uk.CATEGORY_PAGES_PER_NODE, 1, amazon_uk.MAX_PAGES_HARD)
+            bs_pages = _ask_int("Best Sellers pages per category (50 each, 0 = skip)",
+                                amazon_uk.CATEGORY_BESTSELLER_PAGES, 0, 2)
+            budget = _ask_int("Page loads this run (0 = no limit — long runs get blocked)",
+                              amazon_uk.CATEGORY_PAGES_PER_RUN, 0, 100000)
+
+            resume = False
+            saved = amazon_uk.category_checkpoint_summary()
+            if saved:
+                print(f"\n💾 Checkpoint from {saved['last_collected']}: '{saved['root_name']}' (node "
+                      f"{saved['root_node']}) — {saved['visited']}/{saved['categories']} categories opened, "
+                      f"{saved['products']:,} products")
+                answer = safe_input("Continue from it if it is the same category? (y/n) [default: y]: ",
+                                    default="y").strip().lower()
+                resume = answer in ("", "y", "yes")
+
+            collected_df = await amazon_uk.run_category_crawl(
+                start, max_depth=depth, pages_per_node=pages, bestseller_pages=bs_pages,
+                page_budget=budget or None, resume=resume, exhaustive=every,
+            )
+            df_shop = collected_df
+            if not context_label and not collected_df.empty:
+                context_label = _label_from_keywords([str(collected_df["best_rank_category"].iloc[0]).split(" > ")[0]])
 
         # ── Action 6 : Category Products (Pinduoduo) ──────────────────────────
         elif action == 6:
@@ -1164,9 +1334,17 @@ async def run_manual_pipeline() -> None:
                     if collected_df is None or collected_df.empty:
                         collected_df = df_detail
                 elif platform == "amazon_uk":
+                    df_for_detail = collected_df
+                    if (6 in selected_actions and collected_df is not None
+                            and "best_rank" in collected_df.columns and len(product_urls) > 100):
+                        # a category crawl finds thousands of products — product pages are the slow part
+                        n_open = _ask_int(f"{len(product_urls):,} products found. Open product pages for how "
+                                          "many (best ranked first)", 100, 1, len(product_urls))
+                        df_for_detail = collected_df.head(n_open)
+                        product_urls = df_for_detail["product_url"].dropna().tolist()
                     resume = _ask_resume(amazon_uk, "Amazon UK", "detail")
                     df_detail = await amazon_uk.run_product_detail(
-                        product_urls=product_urls, df_product=collected_df, resume=resume
+                        product_urls=product_urls, df_product=df_for_detail, resume=resume
                     )
                     if collected_df is None or collected_df.empty:
                         collected_df = df_detail

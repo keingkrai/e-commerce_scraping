@@ -24,6 +24,14 @@ How it works
              rating histogram, Best Sellers Rank, "About this item" bullets,
              description, ingredients / important information, product
              details tables, images.
+  • Category: run_category_crawl(start) follows a category's "Department"
+             list down CATEGORY_MAX_DEPTH levels. For every sub-category it
+             reads search page 1 (sorted by Best Sellers), more pages for the
+             lowest ones, and the Best Sellers top 100 (/gp/bestsellers/…).
+             This is the TOP of each sub-category — Amazon stops paging one
+             search after ~7–20 pages, so "every product" is not reachable.
+             Page loads per run are capped (CATEGORY_PAGES_PER_RUN); resume
+             carries on. Output sheets: products / appearances / categories.
   • Reviews: only the reviews printed on the product page (usually ~8 from
              the UK plus some "from other countries"). The full review pages
              require signing in, and this module never signs in.
@@ -39,6 +47,8 @@ How it works
 Public entry-points:
   create_amazon_session(postcode)      set a UK delivery postcode in the saved session
   run_search_keyword(keywords)      →  pd.DataFrame  listing rows
+  run_category_crawl(start)         →  pd.DataFrame  one row per ASIN (best rank first)
+  category_checkpoint_summary()     →  what the category checkpoint holds
   run_product_detail(product_urls)  →  pd.DataFrame  detail rows
   run_product_reviews(product_urls) →  pd.DataFrame  review rows (product-page reviews)
   checkpoint_summary(kind)          →  what a checkpoint holds ("listing" / "detail" / "review")
@@ -52,7 +62,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, quote_plus, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse, urlunparse
 
 import pandas as pd
 from cloakbrowser import launch_persistent_context_async
@@ -78,6 +88,27 @@ MAX_PAGES_HARD = 20                      # Amazon rarely serves more than this p
 PAGE_DELAY_MIN,    PAGE_DELAY_MAX    = 8, 15     # seconds between search pages
 KEYWORD_PAUSE_MIN, KEYWORD_PAUSE_MAX = 30, 60    # seconds between keywords
 DETAIL_DELAY_MIN,  DETAIL_DELAY_MAX  = 8, 15     # seconds between product pages
+
+# Category crawl (run_category_crawl / menu action 6). A whole category is far
+# bigger than Amazon will page through (one search stops at ~7–20 pages), so
+# this collects the TOP of every sub-category, not every product.
+CATEGORY_MAX_DEPTH        = 3        # sub-category levels to follow below the start category
+CATEGORY_MAX_NODES        = 400      # stop adding sub-categories after this many
+CATEGORY_PAGES_PER_NODE   = 3        # search pages per lowest sub-category (~48 items a page)
+CATEGORY_SORT             = "exact-aware-popularity-rank"   # the "Best Sellers" sort; "" = Featured
+CATEGORY_BESTSELLER_PAGES = 2        # Best Sellers pages per category (50 each → top 100); 0 = skip
+BESTSELLER_STORE          = "beauty" # /gp/bestsellers/<store>/<node> — the store the category is in
+CATEGORY_PAGES_PER_RUN    = 300      # page loads per run; run again (resume) to continue
+CATEGORY_EMPTY_IN_A_ROW   = 3        # categories in a row with no items and no sub-categories → stop
+
+# "Every product" mode (run_category_crawl(exhaustive=True)): a lowest category
+# with more results than Amazon will page through is split into price bands,
+# and a band that is still too big is halved, until each band fits. Products
+# without a price (unavailable) never match a price filter, so they are missed.
+CATEGORY_SLICE_TARGET = 300          # results one search may have before it is split (~7 pages of 48)
+PRICE_FILTER          = "p_36"       # Amazon's price refinement: rh=…,p_36:<min>-<max>, in pence
+PRICE_BANDS_PENCE     = [0, 300, 500, 700, 1000, 1500, 2000, 3000, 5000, 10000]   # first split; last = £100+
+MIN_SLICE_PENCE       = 50           # never split a band narrower than 50p — take what Amazon serves
 
 PAGE_TIMEOUT_MS = 60000
 
@@ -325,6 +356,87 @@ _JS_DETAIL = r"""() => {
     reviews,
     location: txt(q('#glow-ingress-line2')),
   };
+}"""
+
+# The "Department" list in a category's search page (left column): ancestors
+# ('‹ Any Department', '‹ Beauty'), the current category (bold, usually not a
+# link), then its sub-categories (links, deeper s-navigation-indent-N).
+_JS_CATEGORY = r"""() => {
+  const txt = (el) => el ? el.textContent.replace(/[​-‏]/g, '').replace(/\s+/g, ' ').trim() : '';
+  const nodeOf = (href) => {
+    let h = href || '';
+    try { h = decodeURIComponent(h); } catch (e) {}
+    const ids = [...h.matchAll(/\bn:(\d+)/g)].map(m => m[1]);
+    if (ids.length) return ids[ids.length - 1];          // rh=n:root,n:child → the deepest one
+    const m = h.match(/[?&]node=(\d+)/);
+    return m ? m[1] : '';
+  };
+  let box = document.querySelector('#departments');
+  if (!box) {
+    const head = [...document.querySelectorAll('#s-refinements span, #s-refinements h2')]
+      .find(e => /^Department$/i.test(txt(e)));
+    box = head ? (head.closest('#s-refinements > div, #s-refinements') || null) : null;
+  }
+  const items = [];
+  if (box) {
+    for (const li of box.querySelectorAll('li')) {
+      const a = li.querySelector('a[href]');
+      const raw = txt(a || li);
+      const m = (li.className || '').match(/s-navigation-indent-(\d+)/);
+      items.push({
+        node: a ? nodeOf(a.getAttribute('href')) : '',
+        name: raw.replace(/^[‹<]\s*/, ''),
+        link: !!a,
+        bold: !!li.querySelector('.a-text-bold'),
+        indent: m ? parseInt(m[1], 10) : null,
+        clear: !!(a && /s-navigation-clear-link/.test(a.className || '')) || /^[‹<]/.test(raw)
+               || /^any department$/i.test(raw),
+      });
+    }
+  }
+  const info = txt(document.querySelector('[data-component-type="s-result-info-bar"] h1, '
+    + '[data-component-type="s-result-info-bar"], .s-breadcrumb'));
+  return { items, info, hasBox: !!box };
+}"""
+
+# A Best Sellers page: the grid's data-client-recs-list JSON lists all 50 ASINs
+# with their rank even before lazy-loaded cards render; cards add title/price.
+_JS_BESTSELLERS = r"""() => {
+  const txt = (el) => el ? el.textContent.replace(/[​-‏]/g, '').replace(/\s+/g, ' ').trim() : '';
+  const ranks = {};
+  for (const g of document.querySelectorAll('[data-client-recs-list]')) {
+    try {
+      for (const r of JSON.parse(g.getAttribute('data-client-recs-list') || '[]')) {
+        if (r && r.id) ranks[r.id] = parseInt(((r.metadataMap || {})['render.zg.rank']) || '0', 10) || null;
+      }
+    } catch (e) {}
+  }
+  let cards = [...document.querySelectorAll('[id="gridItemRoot"]')];
+  if (!cards.length) cards = [...document.querySelectorAll('.zg-grid-general-faceout, li.zg-item-immersion')];
+  const items = {};
+  for (const c of cards) {
+    let asin = '';
+    const d = c.querySelector('[data-asin]');
+    if (d) asin = d.getAttribute('data-asin') || '';
+    const dp = [...c.querySelectorAll('a[href*="/dp/"]')];
+    if (!asin && dp.length) { const m = (dp[0].getAttribute('href') || '').match(/\/dp\/([A-Z0-9]{10})/); if (m) asin = m[1]; }
+    if (!asin || items[asin]) continue;
+    const img = c.querySelector('img');
+    const titles = dp.map(txt).filter(t => t && !/^£/.test(t)).sort((x, y) => y.length - x.length);
+    const reviewA = c.querySelector('a[href*="product-reviews"]');
+    items[asin] = {
+      asin,
+      rank: parseInt(txt(c.querySelector('.zg-bdg-text')).replace(/\D/g, ''), 10) || null,
+      title: titles[0] || (img ? (img.getAttribute('alt') || '') : ''),
+      price: ((c.innerText || '').match(/£\s?[\d,]+(?:\.\d{1,2})?/) || [''])[0],
+      rating: txt(c.querySelector('.a-icon-alt')) || (reviewA ? (reviewA.getAttribute('title') || '') : ''),
+      rating_count: reviewA ? txt(reviewA.querySelector('span.a-size-small')) : '',
+      image: img ? (img.getAttribute('src') || '') : '',
+    };
+  }
+  const next = document.querySelector('ul.a-pagination li.a-last:not(.a-disabled) a');
+  return { ranks: Object.entries(ranks), items: Object.values(items), heading: txt(document.querySelector('h1')),
+           hasNext: !!next };
 }"""
 
 
@@ -933,6 +1045,549 @@ async def run_search_keyword(
 
     _save_checkpoint(all_rows, prefix, LISTING_DEDUPE_COLS, "final")
     return _save_final(all_rows, "amazon_uk_search_list", LISTING_DEDUPE_COLS)
+
+
+# ════════════════════════════════════════════════════════════════
+# Public API: category crawl
+# ════════════════════════════════════════════════════════════════
+_CATEGORY_FILES = {
+    "tree": "temp_amazon_uk_category_tree",
+    "listing": "temp_amazon_uk_category_listing",
+    "tasks": "temp_amazon_uk_category_tasks",
+}
+
+
+class _BudgetSpent(Exception):
+    """This run's page budget is used up — the next (resumed) run carries on."""
+
+
+def _node_from_url(text: str) -> Optional[str]:
+    """Browse-node id from a category / search / Best Sellers URL, or a bare id.
+    'https://www.amazon.co.uk/s?rh=n%3A117332031%2Cn%3A118464031' → '118464031' (the deepest)."""
+    s = unquote(str(text or "")).strip()
+    if re.fullmatch(r"\d{4,}", s):
+        return s
+    ids = re.findall(r"\bn:(\d+)", s)
+    if ids:
+        return ids[-1]
+    for pattern in (r"[?&]node=(\d+)", r"/(?:gp/bestsellers|zgbs)/[^/?#]+/(\d+)"):
+        match = re.search(pattern, s)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _category_url(node: str, page_no: int = 1, sort: str = CATEGORY_SORT,
+                  price: Optional[Tuple[int, Optional[int]]] = None) -> str:
+    rh = f"n:{node}"
+    if price is not None:
+        lo, hi = price
+        rh += f",{PRICE_FILTER}:{lo}-{'' if hi is None else hi}"
+    query = {"rh": rh, "fs": "true"}
+    if sort:
+        query["s"] = sort
+    if page_no > 1:
+        query["page"] = str(page_no)
+    return f"{SEARCH_URL}?{urlencode(query)}"
+
+
+def _bestsellers_url(node: str, pg: int = 1, store: str = BESTSELLER_STORE) -> str:
+    return f"{SITE}/gp/bestsellers/{store}/{node}" + (f"?pg={pg}" if pg > 1 else "")
+
+
+def _result_count_info(text: str) -> Tuple[Optional[int], bool]:
+    """(count, exact): '1-48 of over 30,000 results' → (30000, False); '1-16 of 213 results' → (213, True)."""
+    text = str(text or "")
+    match = re.search(r"of\s+(over\s+)?([\d,]+)\s+results", text, re.I)
+    if match:
+        return int(match.group(2).replace(",", "")), not match.group(1)
+    match = re.search(r"([\d,]+)\s+results", text, re.I)
+    return (int(match.group(1).replace(",", "")), True) if match else (None, False)
+
+
+def _result_count(text: str) -> Optional[int]:
+    """'1-48 of over 30,000 results for' → 30000."""
+    return _result_count_info(text)[0]
+
+
+def _split_price(lo: Optional[int], hi: Optional[int]) -> List[Tuple[int, Optional[int]]]:
+    """Sub-bands of a price band in pence (hi None = no upper end); [] = too narrow to split.
+    The whole category (lo None) first splits into PRICE_BANDS_PENCE."""
+    if lo is None:
+        b = PRICE_BANDS_PENCE
+        return [(b[i], b[i + 1]) for i in range(len(b) - 1)] + [(b[-1], None)]
+    if hi is None:
+        return [(lo, lo * 2), (lo * 2, None)] if lo < 10_000_000 else []
+    if hi - lo < 2 * MIN_SLICE_PENCE:
+        return []
+    mid = lo + (hi - lo) // 2
+    mid -= mid % 10                      # whole 10p steps
+    if mid <= lo:
+        mid = lo + (hi - lo) // 2
+    return [(lo, mid), (mid, hi)]
+
+
+def _slice_label(lo: Optional[int], hi: Optional[int]) -> str:
+    if lo is None:
+        return ""
+    return f"£{lo / 100:.2f}+" if hi is None else f"£{lo / 100:.2f}–£{hi / 100:.2f}"
+
+
+def _parse_departments(data: dict, node: str) -> Tuple[str, List[List[str]]]:
+    """(name of this category, [[child_node, child_name], …]) from _JS_CATEGORY's items.
+    Children are the links listed after the current category and indented deeper —
+    so ancestors above it and siblings at the same level are never followed."""
+    items = data.get("items") or []
+    idx = next((i for i, it in enumerate(items) if it.get("node") == node), None)
+    if idx is None:
+        idx = next((i for i, it in enumerate(items) if it.get("bold") and not it.get("link")), None)
+    if idx is None:
+        idx = next((i for i, it in enumerate(items) if it.get("bold")), None)
+    if idx is None:   # current category not shown: everything that isn't a '‹ back' link
+        name, after, cur_indent = "", [it for it in items if not it.get("clear")], None
+    else:
+        name, after, cur_indent = items[idx].get("name", ""), items[idx + 1:], items[idx].get("indent")
+    children, seen = [], {node}
+    for it in after:
+        child = it.get("node")
+        if not child or child in seen or it.get("clear"):
+            continue
+        if cur_indent is not None and it.get("indent") is not None and it["indent"] <= cur_indent:
+            continue
+        seen.add(child)
+        children.append([child, it.get("name", "")])
+    return name, children
+
+
+def _bestseller_items(payload: dict) -> List[dict]:
+    """All ranked ASINs of a Best Sellers page (from the grid JSON), with card data where rendered."""
+    ranks = {asin: rank for asin, rank in (payload.get("ranks") or [])}
+    cards = {it["asin"]: it for it in (payload.get("items") or []) if it.get("asin")}
+    out = []
+    for asin in list(ranks) + [a for a in cards if a not in ranks]:
+        it = dict(cards.get(asin) or {"asin": asin})
+        it["rank"] = it.get("rank") or ranks.get(asin)
+        out.append(it)
+    return sorted(out, key=lambda it: it.get("rank") or 10 ** 6)
+
+
+def _category_row(node: dict, list_type: str, page_no: int, rank: int, it: dict, price_slice: str = "") -> dict:
+    row = _listing_row(node["path"], page_no, rank, it)
+    row.update({
+        "node_id": node["node_id"],
+        "node_name": node["name"],
+        "node_path": node["path"],
+        "node_depth": int(node["depth"]),
+        "list_type": list_type,                       # 'best_sellers' or 'search'
+        "sort": "" if list_type == "best_sellers" else (CATEGORY_SORT or "featured"),
+        "price_slice": price_slice,                   # '£5.00–£7.00' in "every product" mode
+    })
+    return row
+
+
+def _truthy(value) -> bool:
+    return value is True or str(value).strip().lower() in ("true", "1", "yes")
+
+
+def _save_category_state(tree: Dict[str, dict], rows: List[dict], done: set) -> None:
+    """Checkpoint the tree, the rows and the finished page tasks (quietly — it runs after every page)."""
+    for key, data, cols in (("tree", list(tree.values()), ["node_id"]),
+                            ("listing", rows, ["node_id", "list_type", "asin"]),
+                            ("tasks", [{"task": t} for t in sorted(done)], ["task"])):
+        if data:
+            pd.DataFrame(data).drop_duplicates(subset=cols).to_csv(
+                Path(TEMP_DIR) / f"{_CATEGORY_FILES[key]}.csv", index=False, encoding="utf-8-sig")
+
+
+def _load_category_state(root: str):
+    """(tree, rows, done_tasks, other_root) from the category checkpoint. other_root is
+    set (and the rest empty) when the checkpoint belongs to a different start category.
+    Read as text first: a NaN parent_id would otherwise turn every node id into a float."""
+    folder = Path(TEMP_DIR)
+    path = folder / f"{_CATEGORY_FILES['tree']}.csv"
+    if not path.exists():
+        return {}, [], set(), None
+    try:
+        tdf = pd.read_csv(path, dtype=str).fillna("")
+    except Exception as e:
+        print(f"⚠️  Couldn't read {path}: {e} — starting fresh.")
+        return {}, [], set(), None
+    if tdf.empty:
+        return {}, [], set(), None
+    if tdf["node_id"].iloc[0] != root:
+        return {}, [], set(), tdf["node_id"].iloc[0]
+    tree = {}
+    for n in tdf.to_dict("records"):
+        n["depth"] = int(float(n["depth"] or 0))
+        n["visited"] = _truthy(n["visited"])
+        n["result_count"] = int(float(n["result_count"])) if n["result_count"] else None
+        n["children"] = n["children"] or "[]"
+        tree[n["node_id"]] = n
+    rows: List[dict] = []
+    lpath = folder / f"{_CATEGORY_FILES['listing']}.csv"
+    if lpath.exists():
+        ldf = pd.read_csv(lpath, dtype={"asin": str, "node_id": str})
+        rows = ldf.astype(object).where(ldf.notna(), None).to_dict(orient="records")
+    done: set = set()
+    kpath = folder / f"{_CATEGORY_FILES['tasks']}.csv"
+    if kpath.exists():
+        done = set(pd.read_csv(kpath, dtype=str)["task"].dropna())
+    print(f"🔁 Checkpoint loaded: {len(tree)} categor(ies), {len(rows):,} row(s), {len(done):,} page(s) done")
+    return tree, rows, done, None
+
+
+def category_checkpoint_summary() -> Optional[dict]:
+    """What the category checkpoint holds, so a caller can offer to resume."""
+    path = Path(TEMP_DIR) / f"{_CATEGORY_FILES['tree']}.csv"
+    if not path.exists():
+        return None
+    try:
+        tree = pd.read_csv(path, dtype=str)
+    except Exception:
+        return None
+    if tree.empty:
+        return None
+    listing = Path(TEMP_DIR) / f"{_CATEGORY_FILES['listing']}.csv"
+    rows = pd.read_csv(listing, dtype=str) if listing.exists() else pd.DataFrame()
+    return {
+        "root_node": tree["node_id"].iloc[0],
+        "root_name": tree["name"].iloc[0],
+        "categories": len(tree),
+        "visited": int(tree["visited"].map(_truthy).sum()),
+        "rows": len(rows),
+        "products": rows["asin"].nunique() if "asin" in rows.columns else 0,
+        "last_collected": rows["collected_at"].max() if "collected_at" in rows.columns else "",
+    }
+
+
+async def _scroll_page(page, rounds: int = 8) -> None:
+    """Best Sellers cards render as you scroll."""
+    for _ in range(rounds):
+        await page.mouse.wheel(0, 1600)
+        await asyncio.sleep(random.uniform(0.8, 1.5))
+
+
+def _save_category_final(rows: List[dict], tree: Dict[str, dict]) -> pd.DataFrame:
+    """One workbook: products (one row per ASIN, best rank first), appearances
+    (every category / list an ASIN showed up in), categories (the tree)."""
+    if not rows:
+        print("   ⚠️  No data to save: amazon_uk_category")
+        return pd.DataFrame()
+    df = _sanitize_for_excel(pd.DataFrame(rows).drop_duplicates(subset=["node_id", "list_type", "asin"]))
+    df["_order"] = (df["list_type"] != "best_sellers").astype(int)
+    ordered = df.sort_values(["_order", "search_rank"])
+    first = ordered.drop_duplicates("asin")
+    # A Best Sellers item known only from the grid JSON has no title/price — take
+    # each field from the ASIN's best-ranked appearance that has it.
+    fill_cols = [c for c in ("product_name", "brand", "price_gbp", "list_price_gbp", "rating", "rating_count",
+                             "bought_past_month", "bought_past_month_text", "image_url") if c in df.columns]
+    filled = ordered.replace("", pd.NA).groupby("asin")[fill_cols].first()
+    first = first.drop(columns=fill_cols).merge(filled, left_on="asin", right_index=True, how="left")
+    per_asin = df.groupby("asin").agg(
+        n_categories=("node_id", "nunique"),
+        categories=("node_path", lambda s: " | ".join(list(dict.fromkeys(s))[:5])),
+    )
+    products = first.drop(columns=["_order", "keyword_searched", "page"]).rename(columns={
+        "search_rank": "best_rank", "list_type": "best_rank_list", "node_path": "best_rank_category",
+    }).merge(per_asin, on="asin", how="left")
+    lead = ["asin", "product_name", "brand", "best_rank", "best_rank_list", "best_rank_category",
+            "n_categories", "categories"]
+    products = products[lead + [c for c in products.columns if c not in lead]].reset_index(drop=True)
+
+    parents = {str(n.get("parent_id")) for n in tree.values()}
+    cats = pd.DataFrame([{
+        "node_id": n["node_id"], "name": n["name"], "path": n["path"], "depth": n["depth"],
+        "parent_id": n["parent_id"], "result_count": n.get("result_count"),
+        "result_count_is_exact": _truthy(n.get("result_exact")),
+        "sub_categories_listed": len(json.loads(n.get("children") or "[]")),
+        "crawled_as_lowest": str(n["node_id"]) not in parents, "visited": _truthy(n.get("visited")),
+        "products_collected": len({r["asin"] for r in rows if str(r.get("node_id")) == str(n["node_id"])}),
+        "url": _category_url(n["node_id"], 1, ""),
+    } for n in tree.values()])
+
+    root = next(iter(tree.values()))
+    slug = re.sub(r"[^\w]+", "_", str(root.get("name") or root["node_id"]))[:40].strip("_")
+    xlsx = Path(OUTPUT_DIR) / f"amazon_uk_category_{slug}_{_make_timestamp()}.xlsx"
+    with pd.ExcelWriter(xlsx, engine="openpyxl") as xw:
+        products.to_excel(xw, sheet_name="products", index=False)
+        df.drop(columns=["_order"]).to_excel(xw, sheet_name="appearances", index=False)
+        cats.to_excel(xw, sheet_name="categories", index=False)
+    print("\n" + "=" * 60)
+    print("✅ FINAL FILE SAVED : amazon_uk_category")
+    print(f"📊 Products         : {len(products):,} unique ASIN(s) from {cats['visited'].sum()} categor(ies)")
+    print(f"💾 XLSX             : {xlsx}")
+    print("=" * 60)
+    return products
+
+
+async def run_category_crawl(
+    start: str,
+    max_depth: int = CATEGORY_MAX_DEPTH,
+    pages_per_node: int = CATEGORY_PAGES_PER_NODE,
+    bestseller_pages: int = CATEGORY_BESTSELLER_PAGES,
+    page_budget: Optional[int] = CATEGORY_PAGES_PER_RUN,
+    resume: Optional[bool] = None,
+    exhaustive: bool = False,
+) -> pd.DataFrame:
+    """
+    Collect the top products of a category and all its sub-categories — or,
+    with exhaustive=True, every product Amazon will list in the lowest ones.
+
+    start            : a category URL (/b?node=…, a search URL with rh=n:…, a Best
+                       Sellers URL) or the browse-node number
+    max_depth        : sub-category levels to follow (0 = only the start category)
+    pages_per_node   : search pages (sorted by CATEGORY_SORT, ~48 items each) for
+                       every lowest sub-category; page 1 is read for every category
+    bestseller_pages : Best Sellers pages (50 each) for every category; 0 = skip
+    page_budget      : page loads this run (None = no limit); resume continues
+    resume           : True = continue from the checkpoint of the same start category
+    exhaustive       : page through every lowest category to the end instead of
+                       pages_per_node; one with more than CATEGORY_SLICE_TARGET
+                       results is split into price bands (halved until each fits).
+                       Many more page loads — plan on several runs (resume).
+
+    Steps: (1) open each category's search page — its "Department" list gives
+    the sub-categories, its results give page 1; (2) more search pages for the
+    lowest sub-categories; (3) Best Sellers pages. Returns one row per ASIN
+    (best rank first), the same as the 'products' sheet of the saved workbook.
+    """
+    _reset_run()
+    root = _node_from_url(start)
+    if not root:
+        print(f"❌ No category (browse node) found in: {start}")
+        return pd.DataFrame()
+
+    tree: Dict[str, dict] = {}
+    rows: List[dict] = []
+    done: set = set()
+    if (RESUME_FROM_BACKUP if resume is None else resume):
+        tree, rows, done, other_root = _load_category_state(root)
+        if other_root:
+            print(f"ℹ️  The checkpoint is for category {other_root}, not {root} — starting fresh.")
+    debug_left = {"n": 3}   # empty-page HTML dumps per run
+
+    async def dump_once(label: str):
+        if debug_left["n"] > 0:
+            debug_left["n"] -= 1
+            await _dump_debug(page, label)
+
+    if root not in tree:
+        tree[root] = {"node_id": root, "name": "", "parent_id": "", "depth": 0, "path": "",
+                      "result_count": None, "children": "[]", "visited": False}
+
+    left = {"pages": page_budget}
+
+    def spend():
+        if left["pages"] is not None:
+            if left["pages"] <= 0:
+                raise _BudgetSpent()
+            left["pages"] -= 1
+
+    print(f"\n📂 Amazon UK — Category crawl from node {root}  (depth {max_depth}, {pages_per_node} search "
+          f"page(s) per lowest category, {bestseller_pages} Best Sellers page(s), "
+          f"budget {page_budget or 'no limit'} pages)")
+    try:
+        context, page = await _create_browser_context()
+        async with context:
+            # (1) the tree, breadth first; each visit also yields search page 1
+            empty_in_a_row = 0
+            while True:
+                todo = [n for n in tree.values() if not _truthy(n.get("visited"))]
+                if not todo:
+                    break
+                n = min(todo, key=lambda x: int(x["depth"]))
+                node, depth = n["node_id"], int(n["depth"])
+                spend()
+                await _goto_checked(page, _category_url(node, 1))
+                await _save_sample(page, "category")
+                data = await _evaluate(page, _JS_CATEGORY)
+                name, children = _parse_departments(data, node)
+                parent = tree.get(str(n.get("parent_id") or ""))
+                n["name"] = name or n.get("name") or node
+                n["path"] = f"{parent['path']} > {n['name']}" if parent and parent.get("path") else n["name"]
+                n["result_count"], n["result_exact"] = _result_count_info(data.get("info"))
+                n["children"] = json.dumps(children, ensure_ascii=False)
+                n["visited"] = True
+
+                payload = await _evaluate(page, _JS_SEARCH)
+                seen, page_rows = set(), []
+                for it in payload["items"]:
+                    if it["asin"] not in seen:
+                        seen.add(it["asin"])
+                        page_rows.append(_category_row(n, "search", 1, len(page_rows) + 1, it))
+                rows.extend(page_rows)
+                done.add(f"search:{node}:1")
+                if not payload["hasNext"]:
+                    done.update(f"search:{node}:{p}" for p in range(2, MAX_PAGES_HARD + 1))
+
+                added = 0
+                if depth < max_depth:
+                    for child, child_name in children:
+                        if child not in tree and len(tree) < CATEGORY_MAX_NODES:
+                            tree[child] = {"node_id": child, "name": child_name, "parent_id": node,
+                                           "depth": depth + 1, "path": "", "result_count": None,
+                                           "children": "[]", "visited": False}
+                            added += 1
+                count = f"{n['result_count']:,}" if n["result_count"] else "?"
+                print(f"   📂 [{depth}] {n['path']} — {len(children)} sub-categor(ies) listed, {added} queued · "
+                      f"{len(page_rows)} item(s) on page 1 · {count} results"
+                      + ("" if data.get("hasBox") else "  ⚠️ no Department list found"))
+                if page_rows:
+                    print("      fields: " + _field_coverage(page_rows, ["product_name", "price_gbp", "rating",
+                                                                         "rating_count", "bought_past_month"]))
+                if not page_rows and not children:
+                    empty_in_a_row += 1
+                    await dump_once(f"empty_category_{node}")
+                    if empty_in_a_row >= CATEGORY_EMPTY_IN_A_ROW:
+                        raise _RunStopped(f"{empty_in_a_row} categories in a row had no items and no sub-categories "
+                                          f"— the layout may have changed. Check the saved pages in {LOG_DIR}.")
+                else:
+                    empty_in_a_row = 0
+                _save_category_state(tree, rows, done)
+                await _human_delay(PAGE_DELAY_MIN, PAGE_DELAY_MAX)
+
+            # (2) the lowest categories: more search pages — or, exhaustive, every
+            #     product Amazon will list, splitting big ones into price bands
+            parents = {str(x.get("parent_id")) for x in tree.values()}
+            lowest = [x for x in tree.values() if x["node_id"] not in parents]
+            seen_by_node: Dict[str, set] = {}
+            for r in rows:
+                if r.get("list_type") == "search":
+                    seen_by_node.setdefault(str(r["node_id"]), set()).add(r["asin"])
+
+            def add_items(n: dict, items: List[dict], page_no: int, price_slice: str = "") -> int:
+                have = seen_by_node.setdefault(n["node_id"], set())
+                new = 0
+                for it in items:
+                    if it["asin"] not in have:
+                        have.add(it["asin"])
+                        new += 1
+                        rows.append(_category_row(n, "search", page_no, len(have), it, price_slice))
+                return new
+
+            async def every_product(n: dict) -> None:
+                """Page through one lowest category to the end, split by price where it is too big.
+                Progress lives in `done` (split:/sp:/slice: keys), so a resumed run picks up mid-split."""
+                node = n["node_id"]
+                small = _truthy(n.get("result_exact")) and int(n.get("result_count") or 0) <= CATEGORY_SLICE_TARGET
+                queue: List[Tuple[Optional[int], Optional[int]]] = [(None, None)] if small else _split_price(None, None)
+                while queue:
+                    lo, hi = queue.pop(0)
+                    key = f"{node}:{lo}-{hi}"
+                    if f"split:{key}" in done:
+                        queue[0:0] = _split_price(lo, hi)
+                        continue
+                    if f"slice:{key}" in done:
+                        continue
+                    label = _slice_label(lo, hi)
+                    if lo is None:   # unsplit: page 1 was read in step 1
+                        done.add(f"sp:{key}:1")
+                        if f"search:{node}:2" in done:   # …and it had no next page
+                            done.add(f"slice:{key}")
+                            continue
+                    page_no = 1
+                    while f"sp:{key}:{page_no}" in done:
+                        page_no += 1
+                    while page_no <= MAX_PAGES_HARD:
+                        spend()
+                        await _goto_checked(page, _category_url(node, page_no, price=None if lo is None else (lo, hi)))
+                        payload = await _evaluate(page, _JS_SEARCH)
+                        if page_no == 1:
+                            count, exact = _result_count_info((await _evaluate(page, _JS_CATEGORY)).get("info"))
+                            children = _split_price(lo, hi)
+                            if children and (not exact or (count or 0) > CATEGORY_SLICE_TARGET):
+                                add_items(n, payload["items"], 1, label)
+                                done.add(f"split:{key}")
+                                queue[0:0] = children
+                                print(f"   ✂️  {n['path']} {label}: {count if count is not None else '?'}"
+                                      f"{'' if exact else '+'} results — split into {len(children)} price bands")
+                                _save_category_state(tree, rows, done)
+                                await _human_delay(PAGE_DELAY_MIN, PAGE_DELAY_MAX)
+                                break
+                        new = add_items(n, payload["items"], page_no, label)
+                        done.add(f"sp:{key}:{page_no}")
+                        print(f"   📄 {n['path']} {label or '(all prices)'} page {page_no}: {new} new "
+                              f"(category total {len(seen_by_node.get(node, ())):,})")
+                        _save_category_state(tree, rows, done)
+                        await _human_delay(PAGE_DELAY_MIN, PAGE_DELAY_MAX)
+                        if not payload["items"] or not payload["hasNext"]:
+                            done.add(f"slice:{key}")
+                            break
+                        page_no += 1
+                    else:
+                        done.add(f"slice:{key}")
+
+            if exhaustive:
+                total = sum(int(x.get("result_count") or 0) for x in lowest)
+                pages_needed = total // 45 + len(lowest)
+                runs = f"~{-(-pages_needed // page_budget)} run(s) of {page_budget} pages" if page_budget else "one long run"
+                print(f"\n🧮 Every product of {len(lowest)} lowest categor(ies): Amazon reports about {total:,} "
+                      f"results → at least {pages_needed:,} search pages (more for price splits) — {runs}.")
+                for n in lowest:
+                    await every_product(n)
+            else:
+                for n in lowest:
+                    node = n["node_id"]
+                    for page_no in range(2, min(pages_per_node, MAX_PAGES_HARD) + 1):
+                        task = f"search:{node}:{page_no}"
+                        if task in done:
+                            continue
+                        spend()
+                        await _goto_checked(page, _category_url(node, page_no))
+                        payload = await _evaluate(page, _JS_SEARCH)
+                        new = add_items(n, payload["items"], page_no)
+                        done.add(task)
+                        print(f"   📄 {n['path']} — page {page_no}: {new} new item(s)")
+                        if not new or not payload["hasNext"]:
+                            done.update(f"search:{node}:{p}" for p in range(page_no + 1, MAX_PAGES_HARD + 1))
+                        _save_category_state(tree, rows, done)
+                        await _human_delay(PAGE_DELAY_MIN, PAGE_DELAY_MAX)
+                        if f"search:{node}:{page_no + 1}" in done:
+                            break
+
+            # (3) Best Sellers for every category
+            for n in tree.values():
+                node = n["node_id"]
+                for pg in range(1, bestseller_pages + 1):
+                    task = f"bs:{node}:{pg}"
+                    if task in done:
+                        continue
+                    spend()
+                    await _goto_checked(page, _bestsellers_url(node, pg))
+                    await _scroll_page(page)
+                    await _save_sample(page, "bestsellers")
+                    payload = await _evaluate(page, _JS_BESTSELLERS)
+                    items = _bestseller_items(payload)
+                    for i, it in enumerate(items, start=1):
+                        rows.append(_category_row(n, "best_sellers", pg, it.get("rank") or 50 * (pg - 1) + i, it))
+                    done.add(task)
+                    print(f"   🏆 {n['path']} — Best Sellers page {pg}: {len(items)} item(s)"
+                          + (f"  ({payload.get('heading')})" if pg == 1 else ""))
+                    if items:
+                        print("      fields: " + _field_coverage(
+                            [_listing_row("", 0, 0, it) for it in items], ["product_name", "price_gbp", "rating"]))
+                    else:
+                        await dump_once(f"empty_bestsellers_{node}")
+                    if not items or not payload["hasNext"]:
+                        done.update(f"bs:{node}:{p}" for p in range(pg + 1, bestseller_pages + 1))
+                    _save_category_state(tree, rows, done)
+                    await _human_delay(PAGE_DELAY_MIN, PAGE_DELAY_MAX)
+                    if f"bs:{node}:{pg + 1}" in done:
+                        break
+            print("\n✅ Category crawl complete.")
+    except _BudgetSpent:
+        unopened = sum(1 for n in tree.values() if not _truthy(n.get("visited")))
+        where = (f"{unopened} categor(ies) not opened yet" if unopened
+                 else "all categories opened; still paging through them" + (" / Best Sellers" if bestseller_pages else ""))
+        print(f"\n⏸️  Page budget ({page_budget}) used up — {where}. "
+              "Run action 6 again with the same category and settings and answer 'y' to continue.")
+    except _RunStopped as e:
+        print(f"\n🛑 Stopped: {e}")
+    except Exception as e:
+        print(f"\n🛑 Stopped by unexpected error — saving what was collected: {_where(e)}")
+
+    _save_category_state(tree, rows, done)
+    return _save_category_final(rows, tree)
 
 
 # ════════════════════════════════════════════════════════════════

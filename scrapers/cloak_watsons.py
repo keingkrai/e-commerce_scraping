@@ -12,15 +12,19 @@ Key differences from the original notebook:
 Public entry-points:
   run_search_keyword(keywords)       → pd.DataFrame   full detail rows (brand/price/sold/rating/…)
   run_brand_url(brand_map)           → pd.DataFrame   full detail rows
+  run_all_brands(...)                → pd.DataFrame   EVERY brand on Watsons' brand list
+                                       (resumable across days; detail or listing-only)
   run_product_detail(product_urls)   → pd.DataFrame   detail rows
   run_product_reviews(product_urls)  → pd.DataFrame   review rows
 """
 
 import asyncio
+import csv
 import json
 import random
 import re
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -348,19 +352,56 @@ async def _human_scroll(page, amount: int = 600):
 # ════════════════════════════════════════════════════════════════
 # Low-level: paginate a listing page and collect product links
 # ════════════════════════════════════════════════════════════════
+async def _page_signature(page) -> list:
+    """[tile count, first tile's link, current page number] — changes when the listing page changes."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const t = document.querySelectorAll('e2-product-tile');
+                const a = t.length ? t[0].querySelector('h2 a, a') : null;
+                const cur = document.querySelector('.page-current');
+                return [t.length, a ? (a.getAttribute('href') || a.textContent.trim()) : '',
+                        cur ? cur.innerText : ''];
+            }"""
+        )
+    except Exception:
+        return []
+
+
+async def _wait_for_page_change(page, before: list, timeout: float = 15.0) -> bool:
+    """Poll until the listing differs from *before* (the app swaps tiles a moment after a click)."""
+    waited = 0.0
+    while waited < timeout:
+        await asyncio.sleep(0.5)
+        waited += 0.5
+        now = await _page_signature(page)
+        if now and now != before:
+            await asyncio.sleep(1.0)       # let the rest of the tiles render
+            return True
+    return False
+
+
 async def _go_to_next_page(page) -> bool:
     """
     Try to advance the Watsons pagination bar to the next page.
 
     Returns True if a next-page control was found, visible, enabled, and
-    clicked; False if we're already on the last page.
+    clicked; False if we're already on the last page. After the click it
+    waits for the listing to actually change (a fixed 2 s sleep was too
+    short: the next read could still see the previous page's tiles).
     """
     await _clear_onetrust_overlay(page)
+    before = await _page_signature(page)
 
     next_selectors = [
         "//e2-pagination//a[contains(@aria-label,'Next') or contains(@aria-label,'next')]",
         "//e2-pagination//li[contains(@class,'next')]/a",
-        "//e2-pagination/ul/li[last()]/a",
+        # Brand list pages (Thai UI) build the pager as e2-pagination > div > ul >
+        # li — a "1/2" fractional pager (prev arrow, 1/N, next arrow) at the top and
+        # a numbered one at the bottom, with no aria-label/"next" class. The
+        # next arrow is the last <li> of the first one. `//ul`, not `/ul`: the
+        # old direct-child path never matched, so only page 1 was ever read.
+        "//e2-pagination//ul/li[last()]/a",
     ]
     for sel in next_selectors:
         try:
@@ -377,11 +418,91 @@ async def _go_to_next_page(page) -> bool:
 
             await btn.scroll_into_view_if_needed()
             await btn.click()
-            await asyncio.sleep(2)
-            return True
+            if await _wait_for_page_change(page, before):
+                return True
+            print("   ⏳ Page did not change after the click — clicking once more…")
+            await _clear_onetrust_overlay(page)
+            await btn.click()
+            await _wait_for_page_change(page, before)
+            return True        # if it still looks the same, the repeated-page check in the caller decides
         except Exception:
             continue
     return False
+
+
+def _brand_list_url(url: str) -> str:
+    """
+    A brand's /all-brands/b/<id>/<name> URL is its brand-STORE page for brands
+    that have one ("SHOP BY RANGE" + story, no product tiles at all — e.g.
+    Garnier). The products are at /all-brands/list/<id>/<name>. Brands without
+    a store page redirect there on their own, which hides the difference.
+    """
+    return url.replace("/all-brands/b/", "/all-brands/list/")
+
+
+# Set by _collect_links_from_url for brand/list pages: the "N items" figure the
+# page itself shows, so callers can tell a complete listing from a short one.
+_last_listing_info: dict = {"reported_total": None}
+
+
+async def _reported_total(page) -> Optional[int]:
+    """The 'N items' count Watsons prints on brand list pages, or None."""
+    try:
+        text = await page.evaluate("document.body.innerText")
+    except Exception:
+        return None
+    # English UI: "50 items".  Thai UI: "50 Garnier รายการ" — the "N … รายการ" header
+    # (the per-page choices read "ดูตาม 32 รายการต่อหน้า", where รายการ is glued to ต่อ).
+    m = (re.search(r"([\d,]+)\s+items?\b", text, re.I)
+         or re.search(r"([\d,]+)\s+[^\d\n]{0,60}?รายการ(?=\s)", text))
+    return int(m.group(1).replace(",", "")) if m else None
+
+
+async def _scroll_load_all_tiles(page, max_rounds: int = 80) -> int:
+    """
+    Fallback for brand list pages that render WITHOUT a pagination bar: seen
+    in the English UI, which shows the first batch of tiles (32) and loads the
+    rest on scroll (Garnier: 32, then 50 after scrolling — the page's "50
+    items"). Scroll to the bottom until the tile count stops growing for two
+    rounds in a row. Returns the final tile count. (The Thai UI the scraper
+    runs in has a real pager instead and never gets here.)
+    """
+    prev, stable = -1, 0
+    for _ in range(max_rounds):
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            break
+        await asyncio.sleep(2.0)
+        count = await page.locator("//e2-product-tile").count()
+        stable = stable + 1 if count == prev else 0
+        prev = count
+        if stable >= 2:
+            return count
+    print(f"   ⚠️  Still loading tiles after {max_rounds} scrolls — stopping at {prev}.")
+    return prev
+
+
+async def _read_tile_items(tiles) -> List[dict]:
+    """{product_name, product_url} for each product tile element."""
+    items: List[dict] = []
+    for tile in tiles:
+        try:
+            a_tag = await tile.query_selector("h2 a")
+            if not a_tag:
+                a_tag = await tile.query_selector("a")
+            if not a_tag:
+                continue
+            name = (await a_tag.inner_text()).strip()
+            href = await a_tag.get_attribute("href")
+            if href:
+                # Fix relative URLs leading to Protocol Error
+                if href.startswith("/"):
+                    href = "https://www.watsons.co.th" + href
+                items.append({"product_name": name, "product_url": href})
+        except Exception:
+            continue
+    return items
 
 
 async def _collect_links_from_url(
@@ -405,6 +526,10 @@ async def _collect_links_from_url(
     collected: List[dict] = []
     MAX_PAGES = 200  # safety cap against a runaway loop
     prev_page_urls: set = set()
+
+    start_url = _brand_list_url(start_url)
+    brand_list_page = "/all-brands/list/" in start_url   # scroll-loaded, not paginated
+    _last_listing_info["reported_total"] = None
 
     await page.goto(start_url, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_selector("body", timeout=15_000)
@@ -439,27 +564,25 @@ async def _collect_links_from_url(
 
         await asyncio.sleep(1.5)
 
+        if brand_list_page:
+            if await page.locator("//e2-pagination").count() == 0:
+                await _scroll_load_all_tiles(page)      # no pager → tiles load on scroll
+            if pg == 1:
+                _last_listing_info["reported_total"] = await _reported_total(page)
+
         tiles = await page.query_selector_all("//e2-product-tile")
-        this_page_urls: set = set()
-        for tile in tiles:
-            try:
-                a_tag = await tile.query_selector("h2 a")
-                if not a_tag:
-                    a_tag = await tile.query_selector("a")
+        page_items = await _read_tile_items(tiles)
+        this_page_urls = {it["product_url"] for it in page_items}
 
-                if not a_tag:
-                    continue
-                name = (await a_tag.inner_text()).strip()
-                href = await a_tag.get_attribute("href")
-                if href:
-                    # Fix relative URLs leading to Protocol Error
-                    if href.startswith("/"):
-                        href = "https://www.watsons.co.th" + href
-                    collected.append({"product_name": name, "product_url": href})
-                    this_page_urls.add(href)
-            except Exception:
-                continue
+        # Right after a "next" click the app may not have swapped the tiles yet, so an
+        # identical page is read once more before it is taken as "no further pages".
+        if pg > 1 and this_page_urls and this_page_urls == prev_page_urls:
+            await asyncio.sleep(4)
+            tiles = await page.query_selector_all("//e2-product-tile")
+            page_items = await _read_tile_items(tiles)
+            this_page_urls = {it["product_url"] for it in page_items}
 
+        collected.extend(page_items)
         print(f"   ✅ {len(tiles)} tile(s) on page {pg} ({len(collected)} total so far).")
 
         if pg > 1 and this_page_urls and this_page_urls == prev_page_urls:
@@ -483,6 +606,11 @@ async def _collect_links_from_url(
         if item["product_url"] not in seen_urls:
             seen_urls.add(item["product_url"])
             deduped.append(item)
+
+    reported = _last_listing_info["reported_total"]
+    if reported is not None:
+        flag = "✅" if len(deduped) >= reported else "⚠️ "
+        print(f"   {flag} Collected {len(deduped)} of the {reported} item(s) the page reports.")
     return deduped
 
 # ════════════════════════════════════════════════════════════════
@@ -871,6 +999,369 @@ async def run_brand_url(brand_map: Dict[str, str]) -> pd.DataFrame:
 
     _save_checkpoint(all_rows, "temp_watsons_brand", DETAIL_DEDUPE_COLS, "final")
     return _save_final(all_rows, "watsons_brand", DETAIL_DEDUPE_COLS)
+
+# ════════════════════════════════════════════════════════════════
+# All-brands mode — walk Watsons' whole brand list
+# ════════════════════════════════════════════════════════════════
+# The brand list page (/th/b/brandlist, ~755 brands on one page) is allowed
+# by robots.txt. robots.txt also asks for Crawl-delay 10 and lists visit
+# hours 04:00–08:45 UTC (11:00–15:45 Thai); the visit hours are advisory, so
+# a run outside them only prints a warning.
+BRAND_LIST_URL          = "https://www.watsons.co.th/th/b/brandlist"
+BRAND_LIST_DIR          = Path("./data/brand_links")   # same cache find_brand_links.py writes
+BRAND_LIST_MAX_AGE_DAYS = 7
+BRAND_LIST_MIN_BRANDS   = 100                          # fewer than this = page changed / not loaded
+
+ALL_BRANDS_DELAY          = (10.0, 15.0)   # seconds between brands (robots Crawl-delay: 10)
+ALL_BRANDS_MAX_STALLS     = 5              # this many failed/empty brands in a row = stop (blocked?)
+VISIT_WINDOW_UTC          = (4 * 60, 8 * 60 + 45)   # minutes after 00:00 UTC
+
+
+def _all_brands_prefix(detail: bool) -> str:
+    return "temp_watsons_all_brands" if detail else "temp_watsons_all_brands_listing"
+
+
+def _all_brands_state_path(detail: bool) -> Path:
+    return Path(TEMP_DIR) / f"{_all_brands_prefix(detail)}_state.json"
+
+
+def _load_all_brands_state(detail: bool) -> tuple:
+    """(done, empty_seen): finished brands, and how many separate runs a brand came up empty in."""
+    path = _all_brands_state_path(detail)
+    if not path.exists():
+        return {}, {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("done", {}), data.get("empty_seen", {})
+    except Exception as e:
+        print(f"⚠️  Could not read {path}: {e}")
+        return {}, {}
+
+
+def _save_all_brands_state(detail: bool, done: dict, empty_seen: dict) -> None:
+    payload = {
+        "updated": datetime.now(TZ_THAI).strftime("%Y-%m-%d %H:%M:%S"),
+        "done": done,
+        "empty_seen": empty_seen,
+    }
+    _all_brands_state_path(detail).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+
+
+def all_brands_checkpoint_summary(detail: bool = True) -> Optional[dict]:
+    """What an earlier all-brands run left behind, or None (used by the menu)."""
+    path = _all_brands_state_path(detail)
+    done, _ = _load_all_brands_state(detail)
+    if not done:
+        return None
+    return {
+        "brands_done": len(done),
+        "products": sum(int(v.get("products", 0)) for v in done.values()),
+        "last_collected": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+def _read_brand_list_csv(path: Path) -> List[tuple]:
+    with open(path, encoding="utf-8-sig", newline="") as fh:   # written with a BOM for Excel
+        return [(r["name"], r["url"]) for r in csv.DictReader(fh) if r.get("name") and r.get("url")]
+
+
+def _latest_cached_brand_list() -> Optional[Path]:
+    files = sorted(BRAND_LIST_DIR.glob("watsons_brandlist_*.csv"))
+    if not files:
+        return None
+    latest = files[-1]
+    age_days = (time.time() - latest.stat().st_mtime) / 86400
+    return latest if age_days <= BRAND_LIST_MAX_AGE_DAYS else None
+
+
+async def fetch_brand_list(refresh: bool = False) -> Dict[str, str]:
+    """
+    {brand name: brand page URL} for every brand on Watsons' brand list.
+
+    Uses the cached copy in data/brand_links/ (shared with
+    scripts/find_brand_links.py) when it is under a week old; otherwise
+    reads /th/b/brandlist once and caches it.
+    """
+    entries: List[tuple] = []
+    cached = None if refresh else _latest_cached_brand_list()
+    if cached:
+        entries = _read_brand_list_csv(cached)
+        if len(entries) >= BRAND_LIST_MIN_BRANDS:
+            print(f"📋 Brand list from cache: {cached}  ({len(entries)} brands)")
+        else:
+            entries = []
+
+    if not entries:
+        print(f"🌐 Reading the brand list: {BRAND_LIST_URL}")
+        context, page = await _create_browser_context(block_images=True)
+        async with context:
+            await page.goto(BRAND_LIST_URL, wait_until="domcontentloaded", timeout=60_000)
+            await _accept_cookie(page)
+            await asyncio.sleep(4)
+            pairs = await page.eval_on_selector_all(
+                'a[href*="/all-brands/"]',
+                "els => els.map(e => [e.textContent.trim(), e.getAttribute('href')])",
+            )
+        seen: set = set()
+        for name, href in pairs:
+            url = href if href.startswith("http") else "https://www.watsons.co.th" + href
+            if name and url not in seen:
+                seen.add(url)
+                entries.append((name, url))
+        if len(entries) < BRAND_LIST_MIN_BRANDS:
+            raise RuntimeError(
+                f"Only {len(entries)} brands read from the Watsons brand list — "
+                "page changed or did not finish loading. Nothing saved."
+            )
+        BRAND_LIST_DIR.mkdir(parents=True, exist_ok=True)
+        out = BRAND_LIST_DIR / f"watsons_brandlist_{datetime.now(TZ_THAI):%Y%m%d}.csv"
+        with open(out, "w", encoding="utf-8-sig", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["name", "url"])
+            w.writerows(entries)
+        print(f"💾 {len(entries)} Watsons brands cached → {out}")
+
+    brand_map: Dict[str, str] = {}
+    for name, url in entries:
+        key = name
+        if key in brand_map:                      # two brands with the same display name
+            key = f"{name} [{url.rstrip('/').split('/')[-2]}]"
+        brand_map[key] = url
+    return brand_map
+
+
+def _filter_brands(brand_map: Dict[str, str], only: List[str]) -> Dict[str, str]:
+    """
+    Keep the brands matching *only* (case-insensitive). A term that equals a
+    brand name picks just that brand; otherwise it falls back to "contained
+    in the brand name" and the matches are printed so a wrong hit is visible.
+    """
+    picked: Dict[str, str] = {}
+    for term in only:
+        t = term.strip().lower()
+        if not t:
+            continue
+        exact = [n for n in brand_map if n.lower() == t]
+        hits = exact or [n for n in brand_map if t in n.lower()]
+        if not hits:
+            print(f"   ⚠️  '{term}' is not on the Watsons brand list.")
+            continue
+        if not exact:
+            print(f"   ↪ '{term}' matched: {', '.join(hits[:8])}{' …' if len(hits) > 8 else ''}")
+        for n in hits:
+            picked[n] = brand_map[n]
+    return picked
+
+
+def _warn_outside_visit_window() -> None:
+    now = datetime.now(timezone.utc)
+    minutes = now.hour * 60 + now.minute
+    lo, hi = VISIT_WINDOW_UTC
+    if not (lo <= minutes <= hi):
+        print(
+            "⚠️  robots.txt asks bots to visit between 04:00 and 08:45 UTC "
+            "(11:00–15:45 Thai time); it is "
+            f"{now.astimezone(TZ_THAI):%H:%M} Thai time now. Continuing — the window is advisory."
+        )
+
+
+async def run_all_brands(
+    detail: bool = True,
+    only: Optional[List[str]] = None,
+    max_brands: Optional[int] = None,
+    resume: bool = True,
+    refresh_list: bool = False,
+) -> pd.DataFrame:
+    """
+    Scrape EVERY brand on Watsons' brand list (~755), one brand page after
+    another, paced at the robots.txt Crawl-delay between brands.
+
+    Parameters
+    ----------
+    detail : bool
+        True  → full product detail per product (same columns as run_brand_url).
+        False → listing only (brand, product_name, product_url) — far faster;
+                run action 3 / run_product_detail on the result afterwards.
+    only : list[str], optional
+        Restrict to these brand names (exact name, else "contained in").
+    max_brands : int, optional
+        Brands to scrape in THIS run — lets a long job span several days.
+    resume : bool
+        Skip brands finished in an earlier run (progress is saved after
+        every brand in data/watsons/collected_data/temp/).
+    refresh_list : bool
+        Re-read the brand list even if a cached copy is under a week old.
+
+    A brand is only marked finished when all of its products were collected,
+    so a brand that timed out or loaded empty is retried on the next run. The
+    run stops early after ALL_BRANDS_MAX_STALLS failed/empty brands in a row
+    (usually a block or CAPTCHA — solve it in the browser, then resume).
+
+    Returns
+    -------
+    pd.DataFrame — one row per product with `keyword_searched` = brand name.
+    A per-brand summary CSV is written next to the final file.
+    """
+    brand_map = await fetch_brand_list(refresh=refresh_list)
+    if only:
+        brand_map = _filter_brands(brand_map, only)
+        if not brand_map:
+            print("❌ None of the requested brands were found on the Watsons brand list.")
+            return pd.DataFrame()
+
+    prefix = _all_brands_prefix(detail)
+    all_rows: List[dict] = []
+    done: dict = {}
+    empty_seen: dict = {}
+    if resume:
+        done, empty_seen = _load_all_brands_state(detail)
+        if done:
+            all_rows = _load_backup(prefix, DETAIL_DEDUPE_COLS)
+    seen_urls = {r["product_url"] for r in all_rows}
+
+    todo = [(n, u) for n, u in brand_map.items() if n not in done]
+    already = len(brand_map) - len(todo)
+    if max_brands:
+        todo = todo[:max_brands]
+
+    mode = "full detail" if detail else "listing only"
+    print(f"\n🏷️  Watsons — ALL brands ({mode}): {len(brand_map)} brand(s) in scope, "
+          f"{already} already done, {len(todo)} to scrape in this run.")
+    if not todo:
+        print("✅ Nothing left to do for these brands.")
+    else:
+        _warn_outside_visit_window()
+
+    context = None
+    outcome: Dict[str, str] = {}
+    stalled = 0                      # consecutive failed / unconfirmed-empty brands this run
+    pending_empty: List[str] = []    # empty brands waiting for a later brand to prove the site works
+    if todo:
+        context, page = await _create_browser_context(block_images=False)
+    cookie_dismissed = False
+
+    try:
+        if context is not None:
+            async with context:
+                for i, (name, url) in enumerate(todo, 1):
+                    print(f"\n{'─' * 60}\n[{i}/{len(todo)}] 🏷️  {name}  →  {url}")
+                    try:
+                        links = await _collect_links_from_url(page, url, cookie_dismissed)
+                        cookie_dismissed = True
+                        reported = _last_listing_info["reported_total"]   # the page's own "N items"
+
+                        if not links:
+                            # A genuinely empty brand and a block look the same. It is
+                            # confirmed empty when a later brand in this run loads fine,
+                            # or when it comes up empty again in a separate run.
+                            empty_seen[name] = empty_seen.get(name, 0) + 1
+                            print("   ⚠️  No products listed for this brand.")
+                            if empty_seen[name] >= 2:
+                                outcome[name] = "empty"
+                                done[name] = {"products": 0,
+                                              "at": datetime.now(TZ_THAI).strftime("%Y-%m-%d %H:%M:%S")}
+                                print("      (empty in two separate runs — treating as an empty brand)")
+                            else:
+                                outcome[name] = "empty (unconfirmed)"
+                                pending_empty.append(name)
+                                stalled += 1
+                        else:
+                            if detail:
+                                await _scrape_details_concurrent(
+                                    context, links, seen_urls, all_rows, prefix,
+                                    DETAIL_DEDUPE_COLS, label=name, label_key="keyword_searched",
+                                )
+                            else:
+                                now = datetime.now(TZ_THAI).strftime("%Y-%m-%d %H:%M:%S")
+                                for it in links:
+                                    if it["product_url"] in seen_urls:
+                                        continue
+                                    seen_urls.add(it["product_url"])
+                                    all_rows.append({
+                                        "brand":            name,
+                                        "product_name":     it["product_name"],
+                                        "product_url":      it["product_url"],
+                                        "brand_url":        url,
+                                        "keyword_searched": name,
+                                        "source":           "Watsons",
+                                        "collected_at":     now,
+                                    })
+
+                            missing = sum(1 for it in links if it["product_url"] not in seen_urls)
+                            if missing:
+                                outcome[name] = f"partial ({missing} of {len(links)} not collected)"
+                                print(f"   ⚠️  {missing}/{len(links)} product page(s) failed — "
+                                      "this brand will be retried on the next run.")
+                            else:
+                                outcome[name] = "done"
+                                done[name] = {
+                                    "products": len(links),
+                                    "reported": reported,
+                                    "at": datetime.now(TZ_THAI).strftime("%Y-%m-%d %H:%M:%S"),
+                                }
+                                # a brand that worked proves the site isn't blocking, so the
+                                # brands that came up empty just before it really are empty
+                                for empty_name in pending_empty:
+                                    outcome[empty_name] = "empty"
+                                    done[empty_name] = {"products": 0, "at": done[name]["at"]}
+                                pending_empty.clear()
+                                stalled = 0
+
+                    except Exception as exc:
+                        outcome[name] = f"failed: {exc}"
+                        stalled += 1
+                        print(f"   ❌ Error on brand '{name}': {exc}")
+
+                    _save_all_brands_state(detail, done, empty_seen)
+                    _save_checkpoint(all_rows, prefix, DETAIL_DEDUPE_COLS, f"brand {i}/{len(todo)}")
+
+                    if stalled >= ALL_BRANDS_MAX_STALLS:
+                        print(f"\n🛑 {stalled} brands in a row failed or came up empty — "
+                              "probably blocked / CAPTCHA. Stopping; solve it in the browser, "
+                              "then run again with resume.")
+                        break
+
+                    if i < len(todo):
+                        await _human_delay(*ALL_BRANDS_DELAY)
+    finally:
+        _save_all_brands_state(detail, done, empty_seen)
+
+    _save_checkpoint(all_rows, prefix, DETAIL_DEDUPE_COLS, "final")
+    df = _save_final(all_rows, "watsons_all_brands" if detail else "watsons_all_brands_listing",
+                     DETAIL_DEDUPE_COLS)
+
+    # Per-brand summary: what each brand in scope ended as, and how many products it has
+    counts = (
+        df["keyword_searched"].value_counts().to_dict()
+        if not df.empty and "keyword_searched" in df.columns else {}
+    )
+    summary = []
+    for name, url in brand_map.items():
+        if name in done:
+            got, site = done[name].get("products", 0), done[name].get("reported")
+            if not got:
+                status = "done (0 products)"
+            elif site and got < site:
+                status = f"done, but SHORT: page says {site} items, got {got}"
+            else:
+                status = "done"
+        else:
+            status = outcome.get(name, "not run yet")
+        summary.append({"brand": name, "brand_url": url, "status": status,
+                        "products_collected": counts.get(name, 0)})
+    sum_path = Path(OUTPUT_DIR) / f"watsons_all_brands_summary_{_make_timestamp()}.csv"
+    pd.DataFrame(summary).to_csv(sum_path, index=False, encoding="utf-8-sig")
+    left = sum(1 for s in summary if not s["status"].startswith("done"))
+    short = [s["brand"] for s in summary if "SHORT" in s["status"]]
+    print(f"📋 Brand summary: {sum_path}")
+    print(f"   {len(brand_map) - left}/{len(brand_map)} brand(s) finished"
+          + (f" — {left} left; run again with resume to continue." if left else "."))
+    if short:
+        print(f"   ⚠️  {len(short)} brand(s) returned fewer products than the page reports: "
+              f"{', '.join(short[:10])}{' …' if len(short) > 10 else ''}")
+    return df
 
 async def run_product_detail(
     product_urls: Optional[List[str]] = None,
