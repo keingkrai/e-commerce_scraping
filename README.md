@@ -76,5 +76,11 @@ python scripts/scrape_lemon8_search.py --keyword "..." --urls-file urls.txt
 - Pinduoduo / Taobao ต้อง login ก่อน (action 0) — session จะเก็บไว้ใน
   `data/<site>/my_session`
 - Amazon UK ต้องรัน action 0 หนึ่งครั้งเพื่อตั้ง postcode UK
+- Watsons โหมด **ทุกแบรนด์**: Manual → Watsons → action 2 → เลือก `2` (หรือใส่ `"ALL"`
+  ใน `WATSONS_LINK` ของไฟล์ memory) — วนทุกแบรนด์ใน `/th/b/brandlist` (~755 แบรนด์)
+  เก็บความคืบหน้าทุกแบรนด์ หยุดแล้วรันต่อได้ (เลือก resume) ตั้งจำนวนแบรนด์ต่อรอบได้
+  และเลือกเก็บเฉพาะรายชื่อสินค้า+URL (เร็ว, ไว้ทำ action 3 ทีหลัง) หรือ detail เต็ม
+  หน่วงระหว่างแบรนด์ 10–15 วินาทีตาม robots.txt (Crawl-delay 10; ขอให้เข้าช่วง 11:00–15:45 น.)
+  ผลอยู่ที่ `data/watsons/collected_data/watsons_all_brands*_<เวลา>.xlsx` + ไฟล์สรุปรายแบรนด์
 - `scrap_agent.py` ใช้ไฟล์ memory JSON ที่ `MEMORY_FILE` (แก้ path ได้ในไฟล์
   หรือพิมพ์ path ใหม่ตอนรัน)
