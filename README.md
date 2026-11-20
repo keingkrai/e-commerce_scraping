@@ -15,6 +15,8 @@
 | UK | Superdrug | `scrapers/cloak_superdrug.py` |
 | UK | Tesco | `scrapers/cloak_tesco.py` |
 | UK | Amazon UK | `scrapers/cloak_amazon_uk.py` |
+| ทุกประเทศ (ค่าเริ่มต้น TH) | TikTok Top Ads (Creative Center) | `scrapers/cloak_tiktok_topads.py` |
+| ทุกประเทศ (ค่าเริ่มต้น TH) | TikTok Hashtag ยอดนิยม (Trends) | `scrapers/cloak_tiktok_hashtags.py` |
 
 ## โครงสร้างโปรเจกต์
 
@@ -76,6 +78,18 @@ python scripts/scrape_lemon8_search.py --keyword "..." --urls-file urls.txt
 - Pinduoduo / Taobao ต้อง login ก่อน (action 0) — session จะเก็บไว้ใน
   `data/<site>/my_session`
 - Amazon UK ต้องรัน action 0 หนึ่งครั้งเพื่อตั้ง postcode UK
+- TikTok Top Ads: Manual → `10` → action 0 (login บัญชี TikTok ครั้งแรก — ถ้าไม่ login
+  เห็นแค่ 3 โฆษณา) แล้ว action 7 เลือกประเทศ / ช่วงเวลา (7, 30, 180 วัน) / การเรียงลำดับ /
+  อุตสาหกรรม (เช่น `Beauty & Personal Care`) หรือรันตรง ๆ:
+  `python -m scrapers.cloak_tiktok_topads --periods 30,180 --industries "Beauty & Personal Care"`
+  — ลิงก์วิดีโอ / ปกในไฟล์ผลลัพธ์หมดอายุภายในไม่กี่ชั่วโมง
+- TikTok Hashtag ยอดนิยม: Manual → `10` → action 8 (ใช้ login เดียวกับ Top Ads) — top 100
+  hashtag ต่อประเทศ / ช่วงเวลา (7, 30, 90 วัน) / อุตสาหกรรม พร้อมจำนวนโพสต์ ยอดวิว
+  กราฟความนิยมรายวัน และครีเอเตอร์ 3 อันดับแรก หรือรันตรง ๆ:
+  `python -m scrapers.cloak_tiktok_hashtags --periods 30 --industries "Beauty & Personal Care"`
+- TikTok ช่วงเวลา: พิมพ์ `ALL` ในเมนู (หรือ `--periods all`) = ทุกช่วงที่เว็บมี
+  (Top Ads: 7, 30, 180 วัน · Hashtag: 7, 30, 90 วัน) รวมในไฟล์เดียว แยกด้วยคอลัมน์ `period_days`
+- TikTok ทั้งสองแบบ: อย่าย่อหน้าต่างเบราว์เซอร์ระหว่างรัน (หน้าเว็บโหลดเพิ่มเฉพาะตอนที่แสดงบนจอ)
 - Watsons โหมด **ทุกแบรนด์**: Manual → Watsons → action 2 → เลือก `2` (หรือใส่ `"ALL"`
   ใน `WATSONS_LINK` ของไฟล์ memory) — วนทุกแบรนด์ใน `/th/b/brandlist` (~755 แบรนด์)
   เก็บความคืบหน้าทุกแบรนด์ หยุดแล้วรันต่อได้ (เลือก resume) ตั้งจำนวนแบรนด์ต่อรอบได้

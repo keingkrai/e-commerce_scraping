@@ -32,6 +32,10 @@ Supported platforms  (from the JSON memory file):
                                   (run action 0 once first to set a UK delivery postcode;
                                   reviews = only those shown on the product page;
                                   a whole category's top products via action 6)
+  • TikTok Top Ads (manual mode only): TikTok Creative Center top auction ads
+                                  for a country / period / industry → action 7;
+                                  top 100 trending hashtags → action 8
+                                  (both need a logged-in session — action 0 first)
 
 STEPS IN THE PIPELINE
 ──────────────────────
@@ -78,6 +82,8 @@ from scrapers import cloak_taobao         as taobao
 from scrapers import cloak_superdrug      as superdrug
 from scrapers import cloak_tesco          as tesco
 from scrapers import cloak_amazon_uk      as amazon_uk
+from scrapers import cloak_tiktok_topads  as tiktok_topads
+from scrapers import cloak_tiktok_hashtags as tiktok_hashtags
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Config
@@ -112,10 +118,11 @@ STEPS = {
         "name": "Create / Refresh Session",
         "desc": (
             "Login to platform and save browser session\n"
-            "      Amazon UK: no login — sets a UK delivery postcode (UK prices/stock)"
+            "      Amazon UK: no login — sets a UK delivery postcode (UK prices/stock)\n"
+            "      TikTok Top Ads: any TikTok account (signed out only 3 ads show)"
         ),
         "emoji": "🔐",
-        "platforms": ["shopee", "lazada", "pinduoduo", "taobao", "amazon_uk"],
+        "platforms": ["shopee", "lazada", "pinduoduo", "taobao", "amazon_uk", "tiktok_topads"],
     },
     1: {
         "name": "Search by Keyword",
@@ -195,6 +202,27 @@ STEPS = {
         ),
         "emoji": "📂",
         "platforms": ["pinduoduo", "amazon_uk"],
+    },
+    7: {
+        "name": "Collect Top Ads",
+        "desc": (
+            "TikTok Creative Center → Top Ads: every ad in the list for a country /\n"
+            "      period (7, 30, 180 days), optionally per industry — title, brand,\n"
+            "      industry, objective, likes, CTR rank, budget level, video/cover links\n"
+            "      (TH: ~60 ads for 30 days, 400 for 180 days)"
+        ),
+        "emoji": "📣",
+        "platforms": ["tiktok_topads"],
+    },
+    8: {
+        "name": "Collect Trending Hashtags",
+        "desc": (
+            "TikTok Trends → Hashtag: top 100 hashtags for a country / period (7, 30,\n"
+            "      90 days), optionally per industry — posts, views, daily popularity\n"
+            "      curve, top 3 creators (uses the same login as Top Ads)"
+        ),
+        "emoji": "#️⃣",
+        "platforms": ["tiktok_topads"],
     },
 }
 
@@ -362,6 +390,22 @@ def _ask_int(prompt: str, default: int, lo: int, hi: int) -> int:
     if raw:
         print(f"   ↳ not a number from {lo} to {hi} — using {default}")
     return default
+
+
+def _ask_periods(choices, default: int) -> List[int]:
+    """Periods in days, picked from `choices` (comma separated); ALL = every one."""
+    shown = ", ".join(str(p) for p in choices)
+    raw = safe_input(
+        f"Period(s) in days — {shown}, comma separated, or ALL [default: {default}]: ",
+        default=str(default),
+    ).strip()
+    if raw.upper() == "ALL":
+        return list(choices)
+    numbers = [int(p) for p in re.findall(r"\d+", raw)]
+    ignored = [p for p in numbers if p not in choices]
+    if ignored:
+        print(f"   ↳ ignored, not offered by the site: {', '.join(map(str, ignored))}")
+    return list(dict.fromkeys(p for p in numbers if p in choices)) or [default]
 
 
 def _is_all_brands_request(urls: List[str]) -> bool:
@@ -903,8 +947,9 @@ async def run_manual_pipeline() -> None:
     print("7. Superdrug 🟪  (UK)")
     print("8. Tesco     🔵  (UK)")
     print("9. Amazon UK 🟨  (run action 0 once first)")
+    print("10. TikTok Top Ads / Hashtags 🎵  (run action 0 once first)")
 
-    platform_choice = safe_input("\nEnter choice (1-9): ").strip()
+    platform_choice = safe_input("\nEnter choice (1-10): ").strip()
     platform = (
         "shopee"  if platform_choice == "1" else
         "lazada"  if platform_choice == "2" else
@@ -915,6 +960,7 @@ async def run_manual_pipeline() -> None:
         "superdrug" if platform_choice == "7" else
         "tesco"   if platform_choice == "8" else
         "amazon_uk" if platform_choice == "9" else
+        "tiktok_topads" if platform_choice == "10" else
         None
     )
 
@@ -972,6 +1018,8 @@ async def run_manual_pipeline() -> None:
                 await taobao.create_taobao_session()
             elif platform == "amazon_uk":
                 await amazon_uk.create_amazon_session()
+            elif platform == "tiktok_topads":
+                await tiktok_topads.create_tiktok_session()
 
         # ── Action 1 : Search by Keyword ──────────────────────────────────────
         elif action == 1:
@@ -1254,6 +1302,49 @@ async def run_manual_pipeline() -> None:
             df_shop = collected_df
             if not context_label and not collected_df.empty:
                 context_label = _label_from_keywords(collected_df["category_l2"].unique().tolist())
+
+        # ── Action 7 : TikTok Top Ads ─────────────────────────────────────────
+        elif action == 7:
+            default_country = tiktok_topads.DEFAULT_COUNTRY
+            country = safe_input(f"Country code [default: {default_country}]: ",
+                                 default=default_country).strip().upper() or default_country
+            periods = _ask_periods(tiktok_topads.PERIODS, tiktok_topads.DEFAULT_PERIOD)
+            orders = list(tiktok_topads.SORT_OPTIONS)
+            print("\nSort order (sets the rank column):")
+            for i, key in enumerate(orders, 1):
+                print(f"  [{i}] {tiktok_topads.SORT_OPTIONS[key]}")
+            order_by = orders[_ask_int("Choose", 1, 1, len(orders)) - 1]
+            print("\nIndustries: Enter = all industries in one list, or English names / ids from the")
+            print("site's filter, comma separated, e.g.  Beauty & Personal Care , Haircare")
+            industries = [s.strip() for s in safe_input("Industries: ").split(",") if s.strip()]
+            max_items = _ask_int("Max ads per list (0 = all)", 0, 0, 100000)
+
+            collected_df = await tiktok_topads.run_top_ads(
+                country=country, periods=periods, industries=industries, order_by=order_by,
+                max_items_per_list=max_items or None,
+                ask=lambda prompt: asyncio.to_thread(safe_input, prompt),
+            )
+            if not context_label:
+                context_label = _label_from_keywords([country] + industries)
+
+        # ── Action 8 : TikTok trending hashtags ───────────────────────────────
+        elif action == 8:
+            default_country = tiktok_hashtags.DEFAULT_COUNTRY
+            country = safe_input(f"Country code [default: {default_country}]: ",
+                                 default=default_country).strip().upper() or default_country
+            periods = _ask_periods(tiktok_hashtags.PERIODS, tiktok_hashtags.DEFAULT_PERIOD)
+            print("\nIndustries: Enter = all industries, or names / ids, comma separated:")
+            print("  " + ", ".join(tiktok_hashtags.INDUSTRIES.values()))
+            industries = [s.strip() for s in safe_input("Industries: ").split(",") if s.strip()]
+            max_items = _ask_int("Max hashtags per list (0 = all 100)", 0, 0, 100)
+
+            collected_df = await tiktok_hashtags.run_trending_hashtags(
+                country=country, periods=periods, industries=industries,
+                max_items_per_list=max_items or None,
+                ask=lambda prompt: asyncio.to_thread(safe_input, prompt),
+            )
+            if not context_label:
+                context_label = _label_from_keywords([country] + industries)
 
         # ── Actions 3 / 4 / 5 ────────────────────────────────────────────────
         elif action in (3, 4, 5):
